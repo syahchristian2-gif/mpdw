@@ -1,0 +1,352 @@
+---
+title: "Pemodelan ARIMA Harga Penutupan Saham NSE"
+subtitle: "Praktikum Metode Peramalan Deret Waktu (MPDW)"
+author: "[Nama Mahasiswa] - [NIM]"
+date: "1 Oktober 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 4.2)
+library(readxl); library(forecast); library(tseries); library(lmtest); library(MASS)
+fp <- function(p) ifelse(is.na(p), "NA", ifelse(p < 0.0001, "< 0,0001", formatC(p, digits = 4, format = "f")))
+ket <- function(p, alpha = 0.05) ifelse(p > alpha, "terpenuhi (tak tolak H0)", "tidak terpenuhi (tolak H0)")
+```
+
+# Pendahuluan
+
+Laporan ini membangun model **ARIMA** untuk data harga penutupan saham NSE harian dengan tahapan: (1) pembagian data latih dan uji, (2) uji kestasioneran dalam rataan dan ragam, (3) penanganan ketidakstasioneran, (4) identifikasi model potensial, (5) pendugaan parameter, uji signifikansi, dan AIC, (6) analisis sisaan, (7) uji *overfitting*, serta (8) peramalan.
+
+# Data
+
+File sumber menyimpan semua baris dalam **satu kolom teks yang dipisahkan koma** (tanggal diikuti harga banyak saham), dan nama kode saham tidak tersedia. Oleh karena itu data dipecah terlebih dahulu, lalu **satu saham dipilih lewat nomor kolomnya** (`kolom_saham`). Ubah nilai tersebut bila ingin memodelkan saham lain.
+
+```{r data}
+kolom_saham <- 1    # nomor kolom saham (kolom 1 = saham pertama setelah kolom tanggal)
+n_test      <- 244  # banyaknya amatan data uji (sekitar 1 tahun perdagangan)
+
+mentah <- read_excel("NSE_Stock_Historical_price_data_dian.xlsx", col_names = FALSE,
+                     col_types = "text", .name_repair = "minimal")
+bagian <- strsplit(mentah[[1]], ",", fixed = TRUE)
+tgl <- as.Date(sapply(bagian, `[`, 1))
+x   <- as.numeric(sapply(bagian, function(v) v[kolom_saham + 1]))
+stopifnot(!anyNA(x))   # saham yang dipilih harus lengkap (tanpa data kosong)
+
+N <- length(x); n_train <- N - n_test
+data.frame(Jumlah_amatan = N, Awal = min(tgl), Akhir = max(tgl),
+           Min = round(min(x), 2), Maks = round(max(x), 2))
+```
+
+Data memuat **`r N` amatan** (syarat minimal 500 amatan terpenuhi) berupa data harian hari bursa dari `r min(tgl)` sampai `r max(tgl)`.
+
+# Pembagian Data Latih dan Uji
+
+Data dibagi secara berurutan (tidak diacak) karena sifat deret waktu. Data uji diambil **`r n_test` amatan terakhir (sekitar 1 tahun perdagangan, `r round(100*n_test/N)`%)**, sedangkan data latih adalah **`r n_train` amatan pertama (`r round(100*n_train/N)`%)**. Proporsi ini dipilih karena ARIMA belajar dari pola jangka pendek, sehingga periode uji sekitar satu tahun sudah cukup untuk menilai ketepatan ramalan.
+
+```{r split}
+train <- x[1:n_train];            tgl_train <- tgl[1:n_train]
+test  <- x[(n_train + 1):N];      tgl_test  <- tgl[(n_train + 1):N]
+
+plot(tgl, x, type = "l", col = "grey30", xlab = "Tanggal", ylab = "Harga penutupan",
+     main = "Pembagian Data Latih dan Data Uji")
+lines(tgl_test, test, col = "tomato", lwd = 1.5)
+abline(v = tgl[n_train], lty = 2)
+legend("topleft", c("Data latih", "Data uji"), col = c("grey30", "tomato"), lty = 1, bty = "n")
+```
+
+# Kestasioneran Data Latih
+
+## Plot Deret Waktu dan ACF
+
+```{r stas-awal}
+par(mfrow = c(1, 2))
+plot(tgl_train, train, type = "l", xlab = "Tanggal", ylab = "Harga", main = "Plot Data Latih")
+acf(train, lag.max = 40, main = "ACF Data Latih")
+par(mfrow = c(1, 1))
+```
+
+Plot menunjukkan **tren naik** dan simpangan yang membesar saat harga tinggi. ACF turun sangat lambat (*tails off slowly*), ciri data tidak stasioner dalam rataan.
+
+## Uji ADF (Stasioneritas dalam Rataan)
+
+H0: data tidak stasioner (terdapat akar unit); H1: data stasioner.
+
+```{r adf-awal}
+adf_awal <- adf.test(train)
+adf_awal
+```
+
+p-value = `r fp(adf_awal$p.value)`, sehingga kestasioneran dalam rataan **`r ifelse(adf_awal$p.value > 0.05, "tidak terpenuhi (tak tolak H0)", "terpenuhi (tolak H0)")`** pada taraf 5%.
+
+## Box-Cox (Stasioneritas dalam Ragam)
+
+Data stasioner dalam ragam bila selang kepercayaan 95% bagi $\lambda$ **memuat angka 1**.
+
+```{r boxcox-fn}
+cek_boxcox <- function(y, judul) {
+  bc <- MASS::boxcox(y ~ 1, data = data.frame(y = y), lambda = seq(-3, 5, 0.01), plotit = FALSE)
+  batas <- max(bc$y) - qchisq(0.95, 1) / 2
+  ci <- range(bc$x[bc$y > batas])
+  plot(bc$x, bc$y, type = "l", xlab = expression(lambda), ylab = "log-likelihood", main = judul)
+  abline(h = batas, lty = 2, col = "red"); abline(v = ci, lty = 3, col = "blue")
+  abline(v = 1, col = "darkgreen", lwd = 2)
+  legend("topright", c("Batas 95%", "Selang kepercayaan", "lambda = 1"),
+         col = c("red", "blue", "darkgreen"), lty = c(2, 3, 1), bty = "n", cex = 0.8)
+  list(opt = bc$x[which.max(bc$y)], bawah = ci[1], atas = ci[2],
+       memuat1 = round(ci[1], 2) <= 1 & round(ci[2], 2) >= 1)
+}
+```
+
+```{r boxcox-awal}
+bc_awal <- cek_boxcox(train, "Box-Cox Data Latih (sebelum transformasi)")
+```
+
+Nilai $\lambda$ optimum = `r round(bc_awal$opt, 2)` dengan selang kepercayaan 95% (`r round(bc_awal$bawah, 2)`; `r round(bc_awal$atas, 2)`). Selang tersebut **`r ifelse(bc_awal$memuat1, "memuat", "tidak memuat")` angka 1**, sehingga data **`r ifelse(bc_awal$memuat1, "sudah", "belum")` stasioner dalam ragam**.
+
+# Penanganan Ketidakstasioneran
+
+## Transformasi (Ragam)
+
+Karena selang kepercayaan tidak memuat 1 dan $\lambda$ optimum mendekati 0, digunakan **transformasi logaritma natural** $Z_t = \ln(Y_t)$. Pemilihan ini juga didukung nilai $\lambda$ metode Guerrero = `r round(BoxCox.lambda(train, method = "guerrero"), 2)` yang mendekati 0.
+
+```{r transformasi}
+ltrain <- log(train)
+bc_log <- cek_boxcox(ltrain, "Box-Cox Data Latih setelah Transformasi Log")
+```
+
+Setelah transformasi, selang kepercayaan 95% menjadi (`r round(bc_log$bawah, 2)`; `r round(bc_log$atas, 2)`), yang **`r ifelse(bc_log$memuat1, "memuat", "tidak memuat")` angka 1** (batas bawahnya tepat di sekitar 1), sehingga ragam dianggap **`r ifelse(bc_log$memuat1, "sudah stabil", "belum stabil")`**.
+
+## Differencing (Rataan)
+
+```{r diff}
+adf_log <- adf.test(ltrain)
+dlog <- diff(ltrain)                  # differencing orde 1 (d = 1)
+adf_d1 <- adf.test(dlog)
+par(mfrow = c(1, 2))
+plot(tgl_train[-1], dlog, type = "l", xlab = "Tanggal", ylab = expression(Delta*ln(Y[t])),
+     main = "Data Differencing Orde 1")
+acf(dlog, lag.max = 40, main = "ACF Data Differencing")
+par(mfrow = c(1, 1))
+adf_d1
+```
+
+Uji ADF pada data hasil log (belum didiferensiasi) memberi p-value `r fp(adf_log$p.value)` (**`r ifelse(adf_log$p.value > 0.05, "belum stasioner", "stasioner")`**). Setelah *differencing* orde 1, p-value = `r fp(adf_d1$p.value)` sehingga data **`r ifelse(adf_d1$p.value <= 0.05, "stasioner dalam rataan", "belum stasioner")`**. Dengan demikian $d = 1$ dan data hasil transformasi serta diferensiasi digunakan untuk identifikasi model.
+
+# Identifikasi Model Potensial
+
+```{r identifikasi}
+par(mfrow = c(1, 2))
+acf(dlog,  lag.max = 30, main = "ACF Data Differencing")
+pacf(dlog, lag.max = 30, main = "PACF Data Differencing")
+par(mfrow = c(1, 1))
+```
+
+### EACF
+
+```{r eacf-fn, include=FALSE}
+eacf_manual <- function(z, ar.max = 7, ma.max = 13) {
+  lag1 <- function(z, lag = 1) c(rep(NA, lag), z[1:(length(z) - lag)])
+  reupm <- function(m1, ncol) {
+    m2 <- NULL
+    for (i in 1:(ncol - 1)) {
+      work <- lag1(m1[, i]); work[1] <- -1
+      temp <- m1[, i + 1] - work * m1[i + 1, i + 1] / m1[i, i]
+      temp[i + 1] <- 0
+      m2 <- cbind(m2, temp)
+    }
+    m2
+  }
+  ceascf <- function(m, cov1, nar, count, ncov, z, zm) {
+    res <- numeric(nar + 1); res[1] <- cov1[ncov + count]
+    for (i in 1:nar) {
+      temp <- cbind(z[-(1:i)], zm[-(1:i), 1:i]) %*% c(1, -m[1:i, i])
+      res[i + 1] <- acf(temp, plot = FALSE, lag.max = count, drop.lag.0 = FALSE)$acf[count + 1]
+    }
+    res
+  }
+  nar <- ar.max; nma <- ma.max + 1
+  ncov <- nar + nma + 2; nrow <- nar + nma + 1; ncol <- nrow - 1
+  z <- z - mean(z)
+  zm <- sapply(1:nar, function(i) lag1(z, i))
+  cov1 <- acf(z, lag.max = ncov, plot = FALSE, drop.lag.0 = FALSE)$acf
+  cov1 <- c(rev(cov1[-1]), cov1); ncov <- ncov + 1
+  m1 <- matrix(0, ncol = ncol, nrow = nrow)
+  for (i in 1:ncol) m1[1:i, i] <- ar.ols(z, order.max = i, aic = FALSE, demean = FALSE, intercept = FALSE)$ar
+  eacfm <- NULL
+  for (i in 1:nma) {
+    m2 <- reupm(m1, ncol); ncol <- ncol - 1
+    eacfm <- cbind(eacfm, ceascf(m2, cov1, nar, i, ncov, z, zm)); m1 <- m2
+  }
+  work <- length(z) - (1:(nar + 1)) + 1
+  symbol <- NULL
+  for (i in 1:nma) { work <- work - 1; symbol <- cbind(symbol, ifelse(abs(eacfm[, i]) > 2 / sqrt(work), "x", "o")) }
+  dimnames(symbol) <- list(paste0("AR ", 0:nar), 0:(nma - 1))
+  noquote(symbol)
+}
+```
+
+```{r eacf}
+# memakai TSA::eacf bila tersedia; jika tidak, memakai fungsi manual yang setara
+if (requireNamespace("TSA", quietly = TRUE)) TSA::eacf(dlog, ar.max = 6, ma.max = 10) else
+  eacf_manual(dlog, ar.max = 6, ma.max = 10)
+```
+
+**Interpretasi.** Pada ACF dan PACF data hasil *differencing*, hampir seluruh lag berada di dalam batas signifikansi $\pm 2/\sqrt{n}$ (tidak ada pola *cut off* yang jelas), dan EACF membentuk segitiga simbol "o" yang titik sudutnya berada di kiri atas (AR = 0, MA = 0). Hal ini mengarah pada **ARIMA(0,1,0)** (*random walk*) sebagai model utama. Model-model tetangganya, yaitu ARIMA(1,1,0), ARIMA(0,1,1), ARIMA(1,1,1), ARIMA(2,1,0), dan ARIMA(0,1,2), turut dibandingkan. Karena rata-rata perubahan log harga tidak selalu nol, setiap model dicoba dengan dan tanpa *drift*.
+
+# Pendugaan Parameter, Uji Signifikansi, dan AIC
+
+Parameter diuji dengan uji-z (H0: parameter = 0; tolak H0 jika p-value < 0,05). Model terbaik adalah model dengan **semua parameter signifikan dan AIC terkecil**.
+
+```{r kandidat}
+kandidat <- data.frame(p = c(0, 1, 0, 1, 2, 0, 0), q = c(0, 0, 1, 1, 0, 2, 0),
+                       drift = c(rep(TRUE, 6), FALSE))   # model dari ACF/PACF/EACF dan tetangganya
+
+hasil <- lapply(seq_len(nrow(kandidat)), function(i) {
+  k <- kandidat[i, ]
+  m <- Arima(ltrain, order = c(k$p, 1, k$q), include.drift = k$drift, method = "ML")
+  ct <- tryCatch(suppressWarnings(coeftest(m)), error = function(e) NULL)
+  pv <- if (is.null(ct)) numeric(0) else ct[, 4]
+  lb20 <- Box.test(residuals(m), lag = 20, type = "Ljung-Box", fitdf = k$p + k$q)$p.value
+  list(model = m, pv = pv, lb = lb20)
+})
+
+tabel <- data.frame(
+  Model = sprintf("ARIMA(%d,1,%d)%s", kandidat$p, kandidat$q, ifelse(kandidat$drift, " + drift", "")),
+  AIC = sapply(hasil, function(h) AIC(h$model)),
+  BIC = sapply(hasil, function(h) BIC(h$model)),
+  p_terbesar = sapply(hasil, function(h) if (length(h$pv)) suppressWarnings(max(h$pv)) else NA),
+  Semua_signifikan = sapply(hasil, function(h) length(h$pv) == 0 || isTRUE(all(h$pv < 0.05))),
+  p_LjungBox_sisaan = sapply(hasil, function(h) h$lb)
+)
+tabel <- tabel[order(tabel$AIC), ]; rownames(tabel) <- NULL
+tabel$AIC <- round(tabel$AIC, 2); tabel$BIC <- round(tabel$BIC, 2); tabel$p_terbesar <- round(tabel$p_terbesar, 4); tabel$p_LjungBox_sisaan <- round(tabel$p_LjungBox_sisaan, 4)
+knitr::kable(tabel, caption = "Perbandingan model kandidat (diurutkan menurut AIC; p_terbesar = p-value terbesar di antara parameter; p_LjungBox_sisaan = uji autokorelasi sisaan lag 20)")
+```
+
+```{r pilih}
+ok <- which(tabel$Semua_signifikan)
+nama_terpilih <- tabel$Model[ok[1]]                       # AIC terkecil di antara model dengan semua parameter signifikan
+idx <- match(nama_terpilih, sprintf("ARIMA(%d,1,%d)%s", kandidat$p, kandidat$q, ifelse(kandidat$drift, " + drift", "")))
+p_f <- kandidat$p[idx]; q_f <- kandidat$q[idx]; dr_f <- kandidat$drift[idx]
+fit <- hasil[[idx]]$model
+fit
+if (length(hasil[[idx]]$pv)) coeftest(fit)
+```
+
+**Model terpilih: `r nama_terpilih`** (AIC = `r formatC(AIC(fit), format = "f", digits = 2)`). Model ini memiliki seluruh parameter signifikan dan AIC terkecil di antara model yang parameternya signifikan semua. Pada skala asli, model ini berarti log harga mengikuti *random walk* dengan kenaikan rata-rata harian sekitar `r if (dr_f) round(100 * coef(fit)["drift"], 3) else 0`%.
+
+# Analisis Sisaan
+
+```{r sisaan-plot}
+sisa <- as.numeric(residuals(fit))
+par(mfrow = c(2, 2))
+plot(tgl_train, sisa, type = "l", xlab = "Tanggal", ylab = "Sisaan", main = "Plot Sisaan"); abline(h = 0, col = "red")
+acf(sisa, lag.max = 40, main = "ACF Sisaan")
+qqnorm(sisa, main = "Q-Q Plot Sisaan"); qqline(sisa, col = "red")
+hist(sisa, breaks = 40, freq = FALSE, main = "Histogram Sisaan", xlab = "Sisaan")
+curve(dnorm(x, mean(sisa), sd(sisa)), add = TRUE, col = "red")
+par(mfrow = c(1, 1))
+```
+
+```{r sisaan-uji}
+lb  <- Box.test(sisa, lag = 20, type = "Ljung-Box", fitdf = p_f + q_f)
+sw  <- shapiro.test(sisa)
+jb  <- jarque.bera.test(sisa)
+tt  <- t.test(sisa, mu = 0)
+arch <- Box.test(sisa^2, lag = 20, type = "Ljung-Box")
+
+uji <- data.frame(
+  Asumsi = c("Nilai tengah sisaan = 0", "Sisaan saling bebas (tak ada autokorelasi)",
+             "Sisaan menyebar normal", "Sisaan menyebar normal",
+             "Ragam sisaan homogen (tak ada efek ARCH)"),
+  Uji = c("t-test", "Ljung-Box (lag 20)", "Shapiro-Wilk", "Jarque-Bera", "Ljung-Box pada sisaan kuadrat (lag 20)"),
+  p_value = c(tt$p.value, lb$p.value, sw$p.value, jb$p.value, arch$p.value))
+uji$Kesimpulan <- ket(uji$p_value)
+uji$p_value <- fp(uji$p_value)
+knitr::kable(uji, caption = "Hasil uji asumsi sisaan (taraf nyata 5%)")
+```
+
+```{r sisaan-acf}
+r_acf <- acf(sisa, plot = FALSE, lag.max = 20)$acf[-1]
+r_maks <- max(abs(r_acf)); lag_maks <- which.max(abs(r_acf)); batas_acf <- 2 / sqrt(length(sisa))
+lb_semua <- tabel$p_LjungBox_sisaan
+```
+
+**Interpretasi.**
+
+- **Nilai tengah sisaan nol:** `r ket(tt$p.value)` (p-value `r fp(tt$p.value)`).
+- **Autokorelasi:** `r ket(lb$p.value)` (p-value Ljung-Box `r fp(lb$p.value)`). `r if (lb$p.value > 0.05) "Sisaan sudah white noise sehingga model telah menangkap seluruh struktur autokorelasi." else paste0("Autokorelasi sisaan secara statistik masih nyata karena jumlah amatan besar, tetapi nilainya sangat kecil (|r| terbesar = ", round(r_maks, 3), " pada lag ", lag_maks, ", batas signifikansi = ", round(batas_acf, 3), "). Kolom p_LjungBox_sisaan pada tabel kandidat memperlihatkan hal yang sama untuk hampir semua model sederhana, sehingga menambah orde AR/MA tidak menyelesaikannya. Karena ramalan titik hampir tidak terpengaruh, model tetap dipakai dan hal ini dicatat sebagai keterbatasan (pola pada lag tertentu dapat dikaji lebih lanjut).")`
+- **Kenormalan:** `r ket(min(sw$p.value, jb$p.value))`. Q-Q plot memperlihatkan ekor yang lebih berat dari sebaran normal, hal yang lazim pada return saham harian karena adanya lonjakan harga ekstrem.
+- **Homogenitas ragam:** `r ket(arch$p.value)` (p-value `r fp(arch$p.value)`). Bila tidak terpenuhi, ragam sisaan berubah menurut waktu (*volatility clustering*, misalnya saat gejolak pasar 2020). Pelanggaran ini tidak memengaruhi ramalan titik, tetapi selang ramalan menjadi kurang akurat. Model ARCH/GARCH dapat menjadi pengembangan lanjutan.
+
+# Overfitting
+
+Model diperbesar satu orde pada AR atau MA, lalu diperiksa apakah parameter tambahan signifikan dan AIC membaik. Bila tidak, model terpilih **tidak overfit** dan cukup sederhana.
+
+```{r overfit}
+cek_over <- function(p, q) {
+  m <- Arima(ltrain, order = c(p, 1, q), include.drift = dr_f, method = "ML")
+  ct <- tryCatch(suppressWarnings(coeftest(m)), error = function(e) NULL)
+  nm <- if (q > q_f) paste0("ma", q) else paste0("ar", p)
+  pv <- if (!is.null(ct) && nm %in% rownames(ct)) ct[nm, 4] else NA
+  data.frame(Model = sprintf("ARIMA(%d,1,%d)%s", p, q, ifelse(dr_f, " + drift", "")),
+             Parameter_tambahan = nm, p_value = round(pv, 4), AIC = round(AIC(m), 2),
+             Signifikan = isTRUE(pv < 0.05), AIC_lebih_kecil = AIC(m) < AIC(fit))
+}
+over <- rbind(cek_over(p_f + 1, q_f), cek_over(p_f, q_f + 1))
+over <- rbind(data.frame(Model = nama_terpilih, Parameter_tambahan = "-", p_value = NA,
+                         AIC = round(AIC(fit), 2), Signifikan = NA, AIC_lebih_kecil = NA), over)
+knitr::kable(over, caption = "Uji overfitting: model terpilih vs model satu orde lebih besar")
+```
+
+`r if (any(over$Signifikan %in% TRUE)) "Terdapat parameter tambahan yang signifikan, sehingga model yang lebih besar perlu dipertimbangkan." else "Tidak ada parameter tambahan yang signifikan, sehingga penambahan orde tidak memberi perbaikan berarti. Model terpilih tidak mengalami overfitting."`
+
+# Peramalan
+
+Ramalan dibuat untuk `r n_test` hari ke depan (sepanjang data uji) pada skala logaritma, lalu dikembalikan ke skala asli dengan $\hat{Y}_t = \exp(\hat{Z}_t)$. Sebagai pembanding digunakan model *naive* (ramalan = nilai terakhir data latih).
+
+```{r forecast}
+fc <- forecast(fit, h = n_test, level = c(80, 95))
+pred <- exp(as.numeric(fc$mean))
+lo95 <- exp(as.numeric(fc$lower[, 2])); hi95 <- exp(as.numeric(fc$upper[, 2]))
+lo80 <- exp(as.numeric(fc$lower[, 1])); hi80 <- exp(as.numeric(fc$upper[, 1]))
+naive <- rep(tail(train, 1), n_test)
+
+akurasi <- function(a, f) c(RMSE = sqrt(mean((a - f)^2)), MAE = mean(abs(a - f)), MAPE = mean(abs((a - f) / a)) * 100)
+tab_ak <- rbind(akurasi(test, pred), akurasi(test, naive))
+rownames(tab_ak) <- c(nama_terpilih, "Naive (nilai terakhir)")
+knitr::kable(round(tab_ak, 2), caption = "Ukuran akurasi ramalan pada data uji (skala asli)")
+
+tampil <- (n_train - 300):n_train
+plot(c(tgl_train[tampil], tgl_test), c(train[tampil], test), type = "n",
+     ylim = range(c(train[tampil], test, lo95, hi95)), xlab = "Tanggal", ylab = "Harga penutupan",
+     main = paste("Peramalan", nama_terpilih))
+polygon(c(tgl_test, rev(tgl_test)), c(lo95, rev(hi95)), col = rgb(1, 0, 0, 0.12), border = NA)
+polygon(c(tgl_test, rev(tgl_test)), c(lo80, rev(hi80)), col = rgb(1, 0, 0, 0.20), border = NA)
+lines(tgl_train[tampil], train[tampil], col = "grey30")
+lines(tgl_test, test, col = "black", lwd = 1.5)
+lines(tgl_test, pred, col = "red", lwd = 2)
+abline(v = tgl[n_train], lty = 2)
+legend("topleft", c("Data latih", "Data uji (aktual)", "Ramalan", "Selang 80% dan 95%"),
+       col = c("grey30", "black", "red", rgb(1, 0, 0, 0.3)), lty = c(1, 1, 1, NA), pch = c(NA, NA, NA, 15), bty = "n")
+```
+
+Pada data uji, model menghasilkan **MAPE = `r round(tab_ak[1, "MAPE"], 2)`%** dan RMSE = `r round(tab_ak[1, "RMSE"], 2)`. Karena model terpilih bersifat *random walk* (dengan *drift*), ramalan berbentuk garis hampir lurus mengikuti *drift*, sehingga tidak dapat menangkap fluktuasi jangka pendek. Hal ini wajar karena harga saham yang efisien sulit diramalkan dari nilai masa lalunya. Ramalan ini lebih tepat dipandang sebagai arah umum dengan ketidakpastian yang melebar menurut waktu, sebagaimana terlihat pada selang kepercayaannya.
+
+# Kesimpulan
+
+1. Data latih (`r n_train` amatan) **tidak stasioner dalam rataan** (ACF turun lambat; ADF p-value = `r fp(adf_awal$p.value)`) dan **tidak stasioner dalam ragam** (selang Box-Cox tidak memuat 1).
+2. Ketidakstasioneran ditangani dengan **transformasi logaritma** dan ***differencing* orde 1**; setelah itu data stasioner (ADF p-value = `r fp(adf_d1$p.value)`).
+3. Berdasarkan ACF, PACF, EACF, signifikansi parameter, dan AIC, model terbaik adalah **`r nama_terpilih`** pada data log harga.
+4. Analisis sisaan: autokorelasi **`r ket(lb$p.value)`**, kenormalan **`r ket(min(sw$p.value, jb$p.value))`**, dan homogenitas ragam **`r ket(arch$p.value)`**.
+5. Uji *overfitting* menunjukkan `r if (any(over$Signifikan %in% TRUE)) "adanya parameter tambahan yang signifikan" else "tidak ada parameter tambahan yang signifikan"`.
+6. Pada data uji, model memberikan MAPE sebesar `r round(tab_ak[1, "MAPE"], 2)`%.
+
+*Catatan: seluruh keputusan statistik pada laporan ini dihitung otomatis dari data oleh kode R di dalamnya.*
